@@ -4640,6 +4640,225 @@ static constexpr UcodeHandler f3dexHandlers = {
     { F3DEX_G_QUAD, { "G_QUAD", gfx_quad_handler_f3dex } },
 };
 
+// ===== F3DDKR Handlers =====
+
+// DKR vertex: 10 bytes (s16 x,y,z + u8 r,g,b,a). DMA stride is 18 bytes
+// (the extra 8 bytes include per-vertex UVs + padding).
+#pragma pack(push, 1)
+struct DkrVertex {
+    int16_t x, y, z;
+    uint8_t r, g, b, a;
+};
+#pragma pack(pop)
+
+bool gfx_vtx_handler_f3ddkr(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    uint8_t param = C0(16, 8);
+    int n = (param >> 3) + 1;
+    bool append = (param & 1) != 0;
+    size_t dest = append ? gfx->mRsp->dkr_vertex_count : 0;
+
+    const DkrVertex* src = (const DkrVertex*)gfx->SegAddr(cmd->words.w1);
+    if (src == nullptr) return false;
+
+    for (int i = 0; i < n && dest < MAX_VERTICES; i++, dest++) {
+        struct LoadedVertex* d = &gfx->mRsp->loaded_vertices[dest];
+
+        float x = src[i].x;
+        float y = src[i].y;
+        float z = src[i].z;
+
+        // Billboard: add anchor clip coords after MVP transform
+        if (gfx->mRsp->dkr_billboard_enabled && dest > 0 &&
+            append) {
+            // Billboard vertices: transform by billboard matrix (slot 2), then add anchor
+            float (*m)[4] = gfx->mRsp->dkr_matrix_slots[2];
+            x = src[i].x * m[0][0] + src[i].y * m[1][0] + src[i].z * m[2][0] + m[3][0];
+            y = src[i].x * m[0][1] + src[i].y * m[1][1] + src[i].z * m[2][1] + m[3][1];
+            z = src[i].x * m[0][2] + src[i].y * m[1][2] + src[i].z * m[2][2] + m[3][2];
+            float w = src[i].x * m[0][3] + src[i].y * m[1][3] + src[i].z * m[2][3] + m[3][3];
+
+            // Add anchor vertex's clip coords
+            struct LoadedVertex* anchor = &gfx->mRsp->loaded_vertices[0];
+            x += anchor->x;
+            y += anchor->y;
+            z += anchor->z;
+            w += anchor->w;
+
+            d->x = x;
+            d->y = y;
+            d->z = z;
+            d->w = w;
+        } else {
+            // Standard MVP transform
+            float (*m)[4] = gfx->mRsp->MP_matrix;
+            d->x = x * m[0][0] + y * m[1][0] + z * m[2][0] + m[3][0];
+            d->y = x * m[0][1] + y * m[1][1] + z * m[2][1] + m[3][1];
+            d->z = x * m[0][2] + y * m[1][2] + z * m[2][2] + m[3][2];
+            d->w = x * m[0][3] + y * m[1][3] + z * m[2][3] + m[3][3];
+        }
+
+        d->color.r = src[i].r;
+        d->color.g = src[i].g;
+        d->color.b = src[i].b;
+        d->color.a = src[i].a;
+
+        d->clip_rej = 0;
+        if (d->x < -d->w) d->clip_rej |= 1;
+        if (d->x > d->w) d->clip_rej |= 2;
+        if (d->y < -d->w) d->clip_rej |= 4;
+        if (d->y > d->w) d->clip_rej |= 8;
+        if (d->z > d->w) d->clip_rej |= 32;
+
+        d->u = 0;
+        d->v = 0;
+    }
+
+    gfx->mRsp->dkr_vertex_count = append ? dest : n;
+    return false;
+}
+
+// DKR triangle: 16 bytes each (u8 flags + 3 indices + 3 UV pairs)
+#pragma pack(push, 1)
+struct DkrTriangle {
+    uint8_t flags;
+    uint8_t vi0, vi1, vi2;
+    int16_t uv0u, uv0v;
+    int16_t uv1u, uv1v;
+    int16_t uv2u, uv2v;
+};
+#pragma pack(pop)
+
+bool gfx_trin_handler_f3ddkr(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    uint8_t param = C0(16, 8);
+    int numTris = ((param >> 4) & 0xF) + 1;
+
+    const DkrTriangle* tris = (const DkrTriangle*)gfx->SegAddr(cmd->words.w1);
+    if (tris == nullptr) return false;
+
+    for (int i = 0; i < numTris; i++) {
+        gfx->GfxSpTri1(tris[i].vi0, tris[i].vi1, tris[i].vi2, false);
+    }
+
+    return false;
+}
+
+bool gfx_dmadl_handler_f3ddkr(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+    if (subGFX != nullptr) {
+        g_exec_stack.call(*cmd0, subGFX);
+    }
+
+    return false;
+}
+
+bool gfx_moveword_handler_f3ddkr(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    uint8_t index = C0(0, 8);
+    uint16_t offset = C0(8, 16);
+    uintptr_t data = cmd->words.w1;
+
+    switch (index) {
+        case 0x02: // G_MW_BILLBOARD
+            gfx->mRsp->dkr_billboard_enabled = (data != 0);
+            break;
+        case 0x0A: // G_MW_MVPMATRIX — select which matrix slot to use as MVP
+            gfx->mRsp->dkr_mvp_slot = (data >> 6) & 3;
+            {
+                uint8_t slot = gfx->mRsp->dkr_mvp_slot;
+                if (slot < 3) {
+                    memcpy(gfx->mRsp->MP_matrix, gfx->mRsp->dkr_matrix_slots[slot], sizeof(float) * 16);
+                }
+            }
+            break;
+        case 0x06: // G_MW_SEGMENT — standard
+            {
+                int segNumber = offset / 4;
+                gfx->mSegmentPointers[segNumber] = data;
+            }
+            break;
+        case 0x08: // G_MW_FOG — standard
+            gfx->mRsp->fog_mul = (int16_t)(data >> 16);
+            gfx->mRsp->fog_offset = (int16_t)data;
+            break;
+        default:
+            break;
+    }
+
+    return false;
+}
+
+bool gfx_mtx_handler_f3ddkr(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    uint8_t param = C0(16, 8);
+    uint8_t slot = (param >> 6) & 3;
+
+    const int32_t* addr = (const int32_t*)gfx->SegAddr(cmd->words.w1);
+    if (addr == nullptr) return false;
+
+    float (*target)[4];
+    if (slot < 3) {
+        target = gfx->mRsp->dkr_matrix_slots[slot];
+    } else {
+        target = gfx->mRsp->MP_matrix;
+    }
+
+#ifdef GBI_FLOATS
+    memcpy(target, addr, sizeof(float) * 16);
+#else
+    // Convert s16.16 fixed-point to float
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            int32_t q = addr[i * 4 + j];
+            target[i][j] = q / 65536.0f;
+        }
+    }
+#endif
+
+    // If this is the active MVP slot, also update MP_matrix
+    if (slot < 3 && slot == gfx->mRsp->dkr_mvp_slot) {
+        memcpy(gfx->mRsp->MP_matrix, target, sizeof(float) * 16);
+    }
+
+    return false;
+}
+
+static constexpr UcodeHandler f3ddkrHandlers = {
+    { F3DEX_G_NOOP, { "G_NOOP", gfx_noop_handler_f3dex2 } },
+    { F3DEX_G_MTX, { "G_MTX", gfx_mtx_handler_f3ddkr } },
+    { F3DEX_G_MOVEMEM, { "G_MOVEMEM", gfx_movemem_handler_f3d } },
+    { F3DEX_G_VTX, { "G_VTX", gfx_vtx_handler_f3ddkr } },
+    { F3DEX_G_RESERVED1, { "G_TRIN", gfx_trin_handler_f3ddkr } },
+    { F3DEX_G_DL, { "G_DL", gfx_dl_handler_common } },
+    { F3DEX_G_RESERVED2, { "G_DMADL", gfx_dmadl_handler_f3ddkr } },
+    { F3DEX_G_CULLDL, { "G_CULLDL", gfx_cull_dl_handler_f3dex2 } },
+    { F3DEX_G_POPMTX, { "G_POPMTX", gfx_pop_mtx_handler_f3d } },
+    { F3DEX_G_MOVEWORD, { "G_MOVEWORD", gfx_moveword_handler_f3ddkr } },
+    { F3DEX_G_TEXTURE, { "G_TEXTURE", gfx_texture_handler_f3d } },
+    { F3DEX_G_SETOTHERMODE_L, { "G_SETOTHERMODE_L", gfx_othermode_l_handler_f3d } },
+    { F3DEX_G_SETOTHERMODE_H, { "G_SETOTHERMODE_H", gfx_othermode_h_handler_f3d } },
+    { F3DEX_G_SETGEOMETRYMODE, { "G_SETGEOMETRYMODE", gfx_set_geometry_mode_handler_f3dex } },
+    { F3DEX_G_CLEARGEOMETRYMODE, { "G_CLEARGEOMETRYMODE", gfx_clear_geometry_mode_handler_f3dex } },
+    { F3DEX_G_TRI1, { "G_TRI1", gfx_tri1_handler_f3d } },
+    { F3DEX_G_MODIFYVTX, { "G_MODIFYVTX", gfx_modify_vtx_handler_f3dex2 } },
+    { F3DEX_G_DL, { "G_DL", gfx_dl_handler_common } },
+    { F3DEX_G_ENDDL, { "G_ENDDL", gfx_end_dl_handler_common } },
+    { F3DEX_G_SPNOOP, { "G_SPNOOP", gfx_spnoop_command_handler_f3dex2 } },
+    { F3DEX_G_RDPHALF_1, { "mRdpHALF_1", gfx_stubbed_command_handler } },
+};
+
 static constexpr UcodeHandler f3dHandlers = {
     { F3DEX_G_NOOP, { "G_NOOP", gfx_noop_handler_f3dex2 } },
     { F3DEX_G_CULLDL, { "G_CULLDL", gfx_cull_dl_handler_f3dex2 } },
@@ -4681,6 +4900,7 @@ static constexpr std::array ucode_handlers = {
     &f3dexHandlers,  // ucode_f3dexb
     &f3dex2Handlers, // ucode_f3dex2
     &s2dexHandlers,  // ucode_s2dex
+    &f3ddkrHandlers, // ucode_f3ddkr
 };
 
 const char* GfxGetOpcodeName(int8_t opcode) {

@@ -256,6 +256,12 @@ struct RSP {
     } texture_scaling_factor;
 
     struct LoadedVertex loaded_vertices[MAX_VERTICES + 4];
+
+    // DKR F3DDKR-specific state
+    bool dkr_billboard_enabled = false;
+    uint8_t dkr_mvp_slot = 0;
+    float dkr_matrix_slots[3][4][4] = {};
+    uint8_t dkr_vertex_count = 0;
 };
 
 struct RDP {
@@ -447,6 +453,11 @@ class Interpreter {
     void GfxSpMovememF3d(uint8_t index, uint8_t offset, const void* data);
     void GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t data);
     void GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t data);
+    void GfxSpMovewordF3ddkr(uint8_t index, uint16_t offset, uintptr_t data);
+    void GfxSpVertexF3ddkr(uint8_t param, uintptr_t srcAddr);
+    void GfxSpTri1F3ddkr(uint8_t v0, uint8_t v1, uint8_t v2, int16_t u0, int16_t v0uv,
+                          int16_t u1, int16_t v1uv, int16_t u2, int16_t v2uv);
+    void GfxSpMatrixF3ddkr(uint8_t param, const int32_t* addr);
     void GfxSpTexture(uint16_t sc, uint16_t tc, uint8_t level, uint8_t tile, uint8_t on);
     void GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry);
     void GfxDpSetTextureImage(uint32_t format, uint32_t size, uint32_t width, const char* texPath, uint32_t texFlags,
