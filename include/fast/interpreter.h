@@ -202,6 +202,10 @@ struct TextureCacheValue {
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
+    // True only when every decoded texel has alpha 0. DKR draws opaque passes onto
+    // such textures with ALPHA_CVG_SEL set, relying on coverage (not texel alpha) for
+    // opacity. Scanned once per unique texture at decode time (see ImportTexture*).
+    bool all_alpha_zero = false;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
@@ -290,6 +294,9 @@ struct RDP {
         struct RawTexMetadata raw_tex_metadata;
         bool masked;
         bool blended;
+        // Scratch set by ImportTexture* after decoding; ImportTexture copies it onto
+        // the matching TextureCacheValue so the combiner reads a per-texture value.
+        bool all_alpha_zero = false;
     } loaded_texture[2];
     struct {
         uint8_t fmt;

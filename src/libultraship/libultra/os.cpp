@@ -35,6 +35,21 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
 }
 
 int32_t osContStartReadData(OSMesgQueue* mesg) {
+    // On the N64, kicking an SI controller read is asynchronous: when the SI finishes
+    // it raises OS_EVENT_SI, which the kernel uses to post the message registered via
+    // osSetEventMesg() into the title's SI queue. The title then osRecvMesg()'s that
+    // queue to learn the read completed and calls osContGetReadData() to pull the data.
+    //
+    // LUS samples pads synchronously, so there is no real async completion to wait on.
+    // To keep that handshake working we post the completion signal right here: the
+    // title's next osRecvMesg(NOBLOCK) will see it, call osContGetReadData() (which
+    // WriteToPad()s fresh input), then re-arm by calling us again. Without this the SI
+    // queue never receives a message, osContGetReadData() is never reached, and input
+    // stays zeroed (the joypad read path is entirely gated on the recv succeeding).
+    if (mesg != nullptr) {
+        OSMesg signal{};
+        osSendMesg(mesg, signal, OS_MESG_NOBLOCK);
+    }
     return 0;
 }
 

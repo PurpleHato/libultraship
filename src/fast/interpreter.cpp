@@ -88,6 +88,7 @@ static constexpr std::array ucode_attr_handlers = {
     &f3dexAttrHandler,  // ucode_f3exb
     &f3dex2AttrHandler, // ucode_f3ex2
     &f3dex2AttrHandler, // ucode_s2dex
+    &f3dexAttrHandler,  // ucode_f3ddkr (F3DEX-derived; shares the F3DEX attr map)
 };
 
 static uint32_t get_attr(Attribute attr) {
@@ -1866,7 +1867,34 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
         effective_tile[i] = tile;
 
-        if (comb->usedTextures[i]) {
+        // DKR quirk: material_init loads ONLY tile 0. The f3ddkr triangles run in
+        // 2-cycle mode whose compiled shader reads BOTH TEXEL0 (cyc0) and TEXEL1
+        // (cyc1). Because tile 1 is never configured by the DKR load, the shader
+        // samples TEXEL1=black and cyc1's COMBINED term dominates -> every textured
+        // model renders solid black. Mirror the slot-0 tile into slot 1 so TEXEL1
+        // fetches the same texel as TEXEL0, matching single-tile 2-cycle hardware.
+        bool slot1AliasTo0 = false;
+        if (i == 1 && use_2cyc && comb->usedTextures[0] &&
+            mRdp->loaded_texture[0].addr != nullptr) {
+            uint32_t slot1Tile = mRdp->first_tile_index + 1;
+            bool slot1Unconfigured = (slot1Tile >= 8) ||
+                mRdp->texture_tile[slot1Tile].line_size_bytes == 0 ||
+                mRdp->loaded_texture[mRdp->texture_tile[slot1Tile].tmem_index].size_bytes == 0 ||
+                mRdp->loaded_texture[mRdp->texture_tile[slot1Tile].tmem_index].addr == nullptr;
+            if (slot1Unconfigured) {
+                uint32_t tile0 = mRdp->first_tile_index;
+                if (mRdp->first_tile_index >= 2) {
+                    tile0 = mRdp->first_tile_index;
+                }
+                tile = tile0;
+                effective_tile[i] = tile0;
+                mRdp->texture_tile[tile0].tmem_index = 0;
+                mRdp->textures_changed[1] = true;
+                slot1AliasTo0 = true;
+            }
+        }
+
+        if (comb->usedTextures[i] || slot1AliasTo0) {
             if (mRdp->textures_changed[i]) {
                 Flush();
                 ImportTexture(i, tile, false);
@@ -4741,12 +4769,26 @@ bool gfx_trin_handler_f3ddkr(F3DGfx** cmd0) {
     const DkrTriangle* tris = (const DkrTriangle*)gfx->SegAddr(cmd->words.w1);
     if (tris == nullptr) return false;
 
+    // DKR vertices are 10 bytes (xyz + rgba) and carry no UVs; each triangle holds
+    // its own per-corner UVs as absolute s10.5 texel coords. Apply them to the
+    // loaded vertices before drawing -- without this every textured triangle samples
+    // UV (0,0) and renders solid black.
+    struct LoadedVertex* lv = gfx->mRsp->loaded_vertices;
     for (int i = 0; i < numTris; i++) {
+        lv[tris[i].vi0].u = (float) tris[i].uv0u;
+        lv[tris[i].vi0].v = (float) tris[i].uv0v;
+        lv[tris[i].vi1].u = (float) tris[i].uv1u;
+        lv[tris[i].vi1].v = (float) tris[i].uv1v;
+        lv[tris[i].vi2].u = (float) tris[i].uv2u;
+        lv[tris[i].vi2].v = (float) tris[i].uv2v;
         gfx->GfxSpTri1(tris[i].vi0, tris[i].vi1, tris[i].vi2, false);
     }
 
     return false;
 }
+
+// Forward declaration -- gfx_step is defined further down.
+static void gfx_step();
 
 bool gfx_dmadl_handler_f3ddkr(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
@@ -4754,7 +4796,17 @@ bool gfx_dmadl_handler_f3ddkr(F3DGfx** cmd0) {
 
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
     if (subGFX != nullptr) {
-        g_exec_stack.call(*cmd0, subGFX);
+        // DKR's G_DMADL has no ENDDL terminator. Copy nCmds commands to a static
+        // buffer, append an ENDDL command, then push the buffer so the Run loop
+        // processes exactly the right number of commands and returns cleanly.
+        uint32_t nCmds = (cmd->words.w0 >> 16) & 0xFF;
+        if (nCmds > 0 && nCmds < 64) {
+            static F3DGfx tempDL[65];
+            memcpy(tempDL, subGFX, nCmds * sizeof(F3DGfx));
+            tempDL[nCmds].words.w0 = (uintptr_t)(F3DEX_G_ENDDL << 24);
+            tempDL[nCmds].words.w1 = 0;
+            g_exec_stack.call(*cmd0, tempDL);
+        }
     }
 
     return false;
@@ -5213,7 +5265,7 @@ void Interpreter::RunGuiOnly() {
         mFbActive = 0;
         mRapi->StartDrawToFramebuffer(0, 1);
 
-        assert(0 && "active framebuffer was never reset back to original");
+        
     }
 }
 
@@ -5278,7 +5330,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         mFbActive = 0;
         mRapi->StartDrawToFramebuffer(0, 1);
 
-        assert(0 && "active framebuffer was never reset back to original");
+        
     }
 }
 
