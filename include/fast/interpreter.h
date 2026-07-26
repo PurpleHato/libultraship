@@ -302,6 +302,7 @@ struct RDP {
         uint8_t fmt;
         uint8_t siz;
         uint8_t cms, cmt;
+        uint8_t masks, maskt; // mask exponents from SetTile; 2^mask is the WRAP/MIRROR period
         uint8_t shifts, shiftt;
         float uls, ult, lrs, lrt;
         uint16_t tmem; // 0-511, in 64-bit word units
@@ -566,6 +567,10 @@ class Interpreter {
     size_t mShadersIndex;
     int mInterpolationIndex;
     int mInterpolationIndexTarget;
+    // Interpolation factor for the current rendered frame within a game tick:
+    // 0 = previous tick, 1 = current tick. Set by the port before each
+    // DrawAndRunGraphicsCommands call, like mInterpolationIndex.
+    float mInterpolationT = 1.0f;
 };
 
 void gfx_set_target_ucode(UcodeHandlers ucode);

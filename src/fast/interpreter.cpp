@@ -546,6 +546,14 @@ static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageL
     return tileLineSizeBytes;
 }
 
+static uint32_t GetTileSizeFromCoordinates(float low, float high) {
+    float size = (high - low + 4.0f) / 4.0f;
+    if (size <= 0.0f) {
+        return 0;
+    }
+    return static_cast<uint32_t>(lroundf(size));
+}
+
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -571,14 +579,24 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
     uint32_t loadedPixels = width * height;
     uint32_t renderedPixels = tile_w * tile_h;
     bool pyramidLike =
         renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13; // < 1.625x
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
     if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
@@ -641,13 +659,23 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
     uint32_t loadedPixels = width * height;
     uint32_t renderedPixels = tile_w * tile_h;
     bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
     if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
@@ -947,13 +975,23 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
     uint32_t loadedPixels = width * height;
     uint32_t renderedPixels = tile_w * tile_h;
     bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
     if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
@@ -1041,13 +1079,23 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
     uint32_t loadedPixels = width * height;
     uint32_t renderedPixels = tile_w * tile_h;
     bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
     if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
@@ -1157,6 +1205,19 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     // Describe the buffer by what was actually packed (the loaded HD stride)
     uint32_t uploadWidth = safeLineSizeBytes / 4;
     uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+    // LoadBlock can record the whole image as one line, turning e.g. a 256x256
+    // texture into a 65536x1 upload. That exceeds GPU limits and aborts on Metal.
+    if (uploadWidth > (uint32_t)mRapi->GetMaxTextureSize()) {
+        if (safeLoadedBytes == (uint64_t)width * height * 4) {
+            // buffer holds the full image, use its real dimensions
+            uploadWidth = width;
+            uploadHeight = height;
+        } else {
+            // partial load, fall back to the tile-derived dimensions
+            uploadWidth = resultNewLineSize / 4;
+            uploadHeight = resultNewHeight;
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
 }
 
@@ -1948,14 +2009,24 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
             tex_width[i] = line_size;
 
-            tex_width2[i] = (uint32_t)(int32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-            tex_height2[i] = (uint32_t)(int32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+            tex_width2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+            tex_height2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
 
             // Same pyramid-like ratio gate as ImportTexture: only clamp when loaded pixels
             // are close to rendered pixels (mipmap), not when much bigger (window scroll).
             uint32_t loadedPx = tex_width[i] * tex_height[i];
             uint32_t renderedPx = tex_width2[i] * tex_height2[i];
             bool pyrLike = renderedPx > 0 && loadedPx > renderedPx && loadedPx * 8 < renderedPx * 13;
+            // Same wrap-period trim as the import paths. The >= tex_width2 guard skips a stale
+            // mask left by an FB blit (the pause background), which would otherwise tile the FB.
+            uint32_t maskW = mRdp->texture_tile[tile].masks;
+            uint32_t maskH = mRdp->texture_tile[tile].maskt;
+            if (maskW != 0 && (1u << maskW) >= tex_width2[i] && (1u << maskW) < tex_width[i]) {
+                tex_width[i] = 1u << maskW;
+            }
+            if (maskH != 0 && (1u << maskH) >= tex_height2[i] && (1u << maskH) < tex_height[i]) {
+                tex_height[i] = 1u << maskH;
+            }
             // HD replacements must clamp to the tile region
             bool isHd = mRdp->loaded_texture[i].raw_tex_metadata.h_byte_scale != 1 ||
                         mRdp->loaded_texture[i].raw_tex_metadata.v_pixel_scale != 1;
@@ -2415,6 +2486,8 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
     mRdp->texture_tile[tile].siz = siz;
     mRdp->texture_tile[tile].cms = cms;
     mRdp->texture_tile[tile].cmt = cmt;
+    mRdp->texture_tile[tile].masks = masks;
+    mRdp->texture_tile[tile].maskt = maskt;
     mRdp->texture_tile[tile].shifts = shifts;
     mRdp->texture_tile[tile].shiftt = shiftt;
     mRdp->texture_tile[tile].line_size_bytes = line * 8;
@@ -4236,6 +4309,29 @@ bool gfx_set_tile_size_interp_handler_rdp(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
+    F3DGfx* cmd = *cmd0;
+    Interpreter* gfx = mInstance.lock().get();
+
+    int tile = C1(24, 3);
+    float coords[8];
+    for (int i = 0; i < 8; i += 2) {
+        ++(*cmd0);
+        memcpy(&coords[i], &(*cmd0)->words.w0, sizeof(float));
+        memcpy(&coords[i + 1], &(*cmd0)->words.w1, sizeof(float));
+    }
+
+    float t = gfx->mInterpolationT;
+    gfx->mRdp->texture_tile[tile].uls = coords[0] + t * (coords[4] - coords[0]);
+    gfx->mRdp->texture_tile[tile].ult = coords[1] + t * (coords[5] - coords[1]);
+    gfx->mRdp->texture_tile[tile].lrs = coords[2] + t * (coords[6] - coords[2]);
+    gfx->mRdp->texture_tile[tile].lrt = coords[3] + t * (coords[7] - coords[3]);
+    gfx->mRdp->textures_changed[0] = true;
+    gfx->mRdp->textures_changed[1] = true;
+
+    return false;
+}
+
 bool gfx_set_interpolation_index_target(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     Interpreter* gfx = mInstance.lock().get();
@@ -4553,34 +4649,35 @@ static constexpr UcodeHandler rdpHandlers = {
     { RDP_G_SETTARGETINTERPINDEX,
       { "G_SETTARGETINTERPINDEX", gfx_set_interpolation_index_target } }, // G_SETTARGETINTERPINDEX
     { RDP_G_SETTILESIZE_INTERP,
-      { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },            // G_SETTILESIZE_INTERP
-    { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },           // G_TEXRECT (-28)
-    { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },   // G_TEXRECTFLIP (-27)
-    { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },          // mRdpLOADSYNC (-26)
-    { RDP_G_RDPPIPESYNC, { "mRdpPIPESYNC", gfx_stubbed_command_handler } },          // mRdpPIPESYNC (-25)
-    { RDP_G_RDPTILESYNC, { "mRdpTILESYNC", gfx_stubbed_command_handler } },          // mRdpPIPESYNC (-24)
-    { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },          // mRdpFULLSYNC (-23)
-    { RDP_G_SETKEYGB, { "G_SETKEYGB", gfx_set_key_gb_handler_rdp } },                // G_SETKEYGB (-22)
-    { RDP_G_SETKEYR, { "G_SETKEYR", gfx_set_key_r_handler_rdp } },                   // G_SETKEYR (-21)
-    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_set_convert_handler_rdp } },           // G_SETCONVERT (-20)
-    { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },            // G_SETSCISSOR (-19)
-    { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },    // G_SETPRIMDEPTH (-18)
-    { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },   // mRdpSETOTHERMODE (-17)
-    { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                 // G_LOADTLUT (-16)
-    { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },       // G_SETTILESIZE (-14)
-    { RDP_G_LOADBLOCK, { "G_LOADBLOCK", gfx_load_block_handler_rdp } },              // G_LOADBLOCK (-13)
-    { RDP_G_LOADTILE, { "G_LOADTILE", gfx_load_tile_handler_rdp } },                 // G_LOADTILE (-12)
-    { RDP_G_SETTILE, { "G_SETTILE", gfx_set_tile_handler_rdp } },                    // G_SETTILE (-11)
-    { RDP_G_FILLRECT, { "G_FILLRECT", gfx_fill_rect_handler_rdp } },                 // G_FILLRECT (-10)
-    { RDP_G_SETFILLCOLOR, { "G_SETFILLCOLOR", gfx_set_fill_color_handler_rdp } },    // G_SETFILLCOLOR (-9)
-    { RDP_G_SETFOGCOLOR, { "G_SETFOGCOLOR", gfx_set_fog_color_handler_rdp } },       // G_SETFOGCOLOR (-8)
-    { RDP_G_SETBLENDCOLOR, { "G_SETBLENDCOLOR", gfx_set_blend_color_handler_rdp } }, // G_SETBLENDCOLOR (-7)
-    { RDP_G_SETPRIMCOLOR, { "G_SETPRIMCOLOR", gfx_set_prim_color_handler_rdp } },    // G_SETPRIMCOLOR (-6)
-    { RDP_G_SETENVCOLOR, { "G_SETENVCOLOR", gfx_set_env_color_handler_rdp } },       // G_SETENVCOLOR (-5)
-    { RDP_G_SETCOMBINE, { "G_SETCOMBINE", gfx_set_combine_handler_rdp } },           // G_SETCOMBINE (-4)
-    { RDP_G_SETTIMG, { "G_SETTIMG", gfx_set_timg_handler_rdp } },                    // G_SETTIMG (-3)
-    { RDP_G_SETZIMG, { "G_SETZIMG", gfx_set_z_img_handler_rdp } },                   // G_SETZIMG (-2)
-    { RDP_G_SETCIMG, { "G_SETCIMG", gfx_set_c_img_handler_rdp } },                   // G_SETCIMG (-1)
+      { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },                     // G_SETTILESIZE_INTERP
+    { RDP_G_SETTILESIZE_LERP, { "G_SETTILESIZE_LERP", gfx_set_tile_size_lerp_handler_rdp } }, // G_SETTILESIZE_LERP
+    { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },                    // G_TEXRECT (-28)
+    { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },            // G_TEXRECTFLIP (-27)
+    { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },                   // mRdpLOADSYNC (-26)
+    { RDP_G_RDPPIPESYNC, { "mRdpPIPESYNC", gfx_stubbed_command_handler } },                   // mRdpPIPESYNC (-25)
+    { RDP_G_RDPTILESYNC, { "mRdpTILESYNC", gfx_stubbed_command_handler } },                   // mRdpPIPESYNC (-24)
+    { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },                   // mRdpFULLSYNC (-23)
+    { RDP_G_SETKEYGB, { "G_SETKEYGB", gfx_set_key_gb_handler_rdp } },                         // G_SETKEYGB (-22)
+    { RDP_G_SETKEYR, { "G_SETKEYR", gfx_set_key_r_handler_rdp } },                            // G_SETKEYR (-21)
+    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_set_convert_handler_rdp } },                    // G_SETCONVERT (-20)
+    { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },                     // G_SETSCISSOR (-19)
+    { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },             // G_SETPRIMDEPTH (-18)
+    { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },            // mRdpSETOTHERMODE (-17)
+    { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                          // G_LOADTLUT (-16)
+    { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },                // G_SETTILESIZE (-14)
+    { RDP_G_LOADBLOCK, { "G_LOADBLOCK", gfx_load_block_handler_rdp } },                       // G_LOADBLOCK (-13)
+    { RDP_G_LOADTILE, { "G_LOADTILE", gfx_load_tile_handler_rdp } },                          // G_LOADTILE (-12)
+    { RDP_G_SETTILE, { "G_SETTILE", gfx_set_tile_handler_rdp } },                             // G_SETTILE (-11)
+    { RDP_G_FILLRECT, { "G_FILLRECT", gfx_fill_rect_handler_rdp } },                          // G_FILLRECT (-10)
+    { RDP_G_SETFILLCOLOR, { "G_SETFILLCOLOR", gfx_set_fill_color_handler_rdp } },             // G_SETFILLCOLOR (-9)
+    { RDP_G_SETFOGCOLOR, { "G_SETFOGCOLOR", gfx_set_fog_color_handler_rdp } },                // G_SETFOGCOLOR (-8)
+    { RDP_G_SETBLENDCOLOR, { "G_SETBLENDCOLOR", gfx_set_blend_color_handler_rdp } },          // G_SETBLENDCOLOR (-7)
+    { RDP_G_SETPRIMCOLOR, { "G_SETPRIMCOLOR", gfx_set_prim_color_handler_rdp } },             // G_SETPRIMCOLOR (-6)
+    { RDP_G_SETENVCOLOR, { "G_SETENVCOLOR", gfx_set_env_color_handler_rdp } },                // G_SETENVCOLOR (-5)
+    { RDP_G_SETCOMBINE, { "G_SETCOMBINE", gfx_set_combine_handler_rdp } },                    // G_SETCOMBINE (-4)
+    { RDP_G_SETTIMG, { "G_SETTIMG", gfx_set_timg_handler_rdp } },                             // G_SETTIMG (-3)
+    { RDP_G_SETZIMG, { "G_SETZIMG", gfx_set_z_img_handler_rdp } },                            // G_SETZIMG (-2)
+    { RDP_G_SETCIMG, { "G_SETCIMG", gfx_set_c_img_handler_rdp } },                            // G_SETCIMG (-1)
 };
 
 static constexpr UcodeHandler otrHandlers = {
