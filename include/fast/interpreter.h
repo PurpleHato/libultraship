@@ -223,6 +223,7 @@ struct LoadedVertex {
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
+    uint8_t fog = 0; // [port] F3DDKR per-vertex fog factor from transformed depth
 };
 
 struct RawTexMetadata {
@@ -297,6 +298,9 @@ struct RDP {
         // Scratch set by ImportTexture* after decoding; ImportTexture copies it onto
         // the matching TextureCacheValue so the combiner reads a per-texture value.
         bool all_alpha_zero = false;
+        // LoadBlock with dxt 0 (the gDPLoadTextureBlockS family): the source already
+        // has the two 32-bit halves of every 64-bit word exchanged on odd rows.
+        bool line_swapped = false;
     } loaded_texture[2];
     struct {
         uint8_t fmt;
@@ -435,6 +439,7 @@ class Interpreter {
     void TextureCacheClear();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    void TextureCacheDeleteRange(const uint8_t* start, size_t size);
     void ImportTextureRgba16(int tile, bool importReplacement);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
@@ -523,6 +528,7 @@ class Interpreter {
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;
+    std::vector<uint8_t> mLineSwapBuffer;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};
@@ -544,6 +550,13 @@ class Interpreter {
     std::shared_ptr<GfxDebugger> mGfxDebugger;
 
     uintptr_t mSegmentPointers[MAX_SEGMENT_POINTERS]{};
+
+    // [port] F3DDKR's G_DMADL runs a count-bounded sub-DL with no ENDDL terminator, so
+    // the commands are copied into storage the executor walks with a raw pointer. That
+    // storage must be contiguous and never reallocate while sub-DLs are queued (nested
+    // G_DMADL cursors point into it), so capacity is reserved once per frame and growth
+    // past it is refused rather than triggering a reallocation.
+    std::vector<F3DGfx> mDmadlExecArena;
 
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
@@ -582,6 +595,7 @@ const char* GfxGetOpcodeName(int8_t opcode);
 } // namespace Fast
 
 extern "C" void gfx_texture_cache_clear();
+extern "C" void gfx_texture_cache_delete_range(const void* start, size_t size);
 extern "C" void gfx_shader_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize, bool forceFixedAspect = false);

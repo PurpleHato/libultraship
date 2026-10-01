@@ -550,6 +550,39 @@ void GfxDebuggerWindow::DrawDisasNode(const F3DGfx* cmd, std::vector<const F3DGf
                 break;
             }
 
+            // [port] F3DDKR geometry commands. DKR reuses the F3DEX opcode space: G_MTX/G_VTX
+            // keep their opcodes (with DKR-specific arg layouts), and the F3DEX RESERVED slots
+            // are repurposed as G_TRIN (triangle list) and G_DMADL (count-bounded sub-DL).
+            case F3DEX_G_MTX: {
+                uint8_t param = C0(16, 8);
+                int slot = (param >> 6) & 3;
+                nodeWithText(cmd0, fmt::format("G_MTX (DKR): slot={} @ 0x{:x}", slot, cmd->words.w1));
+                cmd++;
+                break;
+            }
+            case F3DEX_G_VTX: {
+                uint8_t param = C0(16, 8);
+                int n = (param >> 3) + 1;
+                int append = param & 1;
+                nodeWithText(cmd0, fmt::format("G_VTX (DKR): {} verts (append={}) @ 0x{:x}", n, append, cmd->words.w1));
+                cmd++;
+                break;
+            }
+            case 5: { // G_TRIN -- F3DDKR triangle list (gSPPolygon)
+                uint8_t hdr = C0(16, 8);
+                int numTris = (hdr >> 4) + 1;
+                int texEnabled = hdr & 0xF;
+                nodeWithText(cmd0, fmt::format("G_TRIN: {} tris (tex={}) @ 0x{:x}", numTris, texEnabled, cmd->words.w1));
+                cmd++;
+                break;
+            }
+            case 7: { // G_DMADL -- F3DDKR count-bounded sub-DL (gDkrDmaDisplayList)
+                int nCmds = C0(16, 8);
+                nodeWithText(cmd0, fmt::format("G_DMADL: {} cmds @ 0x{:x}", nCmds, cmd->words.w1));
+                cmd++;
+                break;
+            }
+
             default: {
                 simpleNode(cmd, opcode);
                 cmd++;
@@ -663,7 +696,7 @@ void GfxDebuggerWindow::DrawDisas() {
                     gui->LoadGuiTexture(name, *metadata.resource, nullptr, ImVec4{ 1.0f, 1.0f, 1.0f, 1.0f });
                 }
 
-                ImGui::Image(gui->GetTextureByName(name), ImVec2{ 100.0f, 100.0f });
+                ImGui::Image(gui->GetTextureByName(name), ImVec2{ 128.0f, 128.0f });
             };
 
             ImGui::Text("Loaded Textures");

@@ -1458,7 +1458,17 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
     auto shader = static_cast<std::string*>(res->GetRawPointer());
     processor.load(*shader);
     processor.bind_include_loader(dx_include_fs);
-    auto result = processor.process();
+    std::string result;
+    try {
+        result = processor.process();
+    } catch (const std::exception& e) {
+        // [port] Log the failing template expression instead of letting the unhandled
+        // exception abort with no message.
+        SPDLOG_CRITICAL("prism shader build failed: {} (shader_id={:x} inputs={} tex0={} tex1={})", e.what(),
+                        cc_features.shader_id, cc_features.numInputs, cc_features.usedTextures[0],
+                        cc_features.usedTextures[1]);
+        throw;
+    }
     numFloats = raw_numFloats;
     // SPDLOG_INFO("=========== DX11 SHADER ============");
     // SPDLOG_INFO(result);

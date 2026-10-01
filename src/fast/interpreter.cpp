@@ -13,6 +13,7 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 #include <list>
 #include <stack>
 #include "fast/resource/type/Light.h"
@@ -340,6 +341,7 @@ void Interpreter::GenerateCC(ColorCombiner* comb, const ColorCombinerKey& key) {
                     case G_CCMUX_PRIMITIVE_ALPHA:
                     case G_CCMUX_PRIM_LOD_FRAC:
                     case G_CCMUX_SHADE:
+                    case G_CCMUX_SHADE_ALPHA:
                     case G_CCMUX_ENVIRONMENT:
                     case G_CCMUX_ENV_ALPHA:
                     case G_CCMUX_LOD_FRACTION:
@@ -531,6 +533,29 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
         if (!again) {
             break;
         }
+    }
+}
+
+// Drops every cached texture whose texels or palettes came from [start, start + size). The cache is
+// keyed by address, so memory the game frees and then reuses would otherwise keep the old image.
+void Interpreter::TextureCacheDeleteRange(const uint8_t* start, size_t size) {
+    const uint8_t* end = start + size;
+    auto inRange = [start, end](const uint8_t* addr) { return addr >= start && addr < end; };
+
+    for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
+        const TextureCacheKey& key = it->first;
+        if (!inRange(key.texture_addr) && !inRange(key.palette_addrs[0]) && !inRange(key.palette_addrs[1])) {
+            ++it;
+            continue;
+        }
+        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+            if (mRenderingState.mTextures[j] == &*it) {
+                mRenderingState.mTextures[j] = nullptr;
+            }
+        }
+        mTextureCache.lru.erase(it->second.lru_location);
+        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+        it = mTextureCache.map.erase(it);
     }
 }
 
@@ -1296,6 +1321,44 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         return;
     }
 
+    // Real TMEM keeps every odd row with the two 32-bit halves of each 64-bit word
+    // exchanged and the texel fetch undoes that. A LoadBlock normally performs the
+    // exchange while loading (driven by dxt), but the "S" load macros pass dxt 0 and
+    // ship the texture pre-swapped instead. The decoders below read rows straight
+    // from memory, so put those odd rows back in order first.
+    struct SwappedSource {
+        const uint8_t** slot;
+        const uint8_t* saved = nullptr;
+        ~SwappedSource() {
+            if (saved != nullptr) {
+                *slot = saved;
+            }
+        }
+    } source{ &mRdp->loaded_texture[tmemIdex].addr };
+    if (mRdp->loaded_texture[tmemIdex].line_swapped && !importReplacement &&
+        tmemIdex == mRdp->texture_tile[tile].tmem_index && metadata->h_byte_scale == 1 &&
+        metadata->v_pixel_scale == 1) {
+        uint32_t pitch = mRdp->texture_tile[tile].line_size_bytes;
+        uint32_t chunk = 8;
+        uint32_t size = mRdp->loaded_texture[tmemIdex].size_bytes;
+        if (siz == G_IM_SIZ_32b) {
+            // A 32-bit tile line counts 16-bit halves, and one word spans 16 source bytes.
+            pitch *= 2;
+            chunk = 16;
+        }
+        if (pitch < size) {
+            mLineSwapBuffer.assign(origAddr, origAddr + size);
+            for (uint32_t row = pitch; row < size; row += pitch * 2) {
+                for (uint32_t off = 0; off + chunk <= pitch && row + off + chunk <= size; off += chunk) {
+                    uint8_t* p = mLineSwapBuffer.data() + row + off;
+                    std::swap_ranges(p, p + chunk / 2, p + chunk / 2);
+                }
+            }
+            source.saved = origAddr;
+            mRdp->loaded_texture[tmemIdex].addr = mLineSwapBuffer.data();
+        }
+    }
+
     if ((texFlags & TEX_FLAG_LOAD_AS_IMG) != 0) {
         ImportTextureImg(tile, importReplacement);
         return;
@@ -1845,7 +1908,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     uint8_t blend_src = mRdp->other_mode_l >> 30;
     bool use_blend_color = blend_src == G_BL_CLR_BL;
     bool use_fog = blend_src == G_BL_CLR_FOG || use_blend_color;
-    bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
+    // [port] F3DDKR cutout detection: G_RM_*_TEX_EDGE sets CVG_X_ALPHA|ALPHA_CVG_SEL,
+    // while G_RM_AA_ZB_XLU_LINE_MOD carries CVG_X_ALPHA|FORCE_BL and is a real blend
+    // (the CVG_X_ALPHA-only test collapses it into a cutout).
+    bool texture_edge =
+        (ucode_handler_index == ucode_f3ddkr)
+            ? ((mRdp->other_mode_l & (CVG_X_ALPHA | ALPHA_CVG_SEL)) == (CVG_X_ALPHA | ALPHA_CVG_SEL) &&
+               (mRdp->other_mode_l & FORCE_BL) == 0)
+            : ((mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA);
     bool use_noise = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER;
     bool use_2cyc = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
     bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
@@ -2133,6 +2203,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             u -= mRdp->texture_tile[uv_tile].uls / 4.0f;
             v -= mRdp->texture_tile[uv_tile].ult / 4.0f;
 
+            // [port] With texture perspective disabled the RSP halves the texcoord
+            // scale; DKR screen-space panels use NOPERSP modes and would sample
+            // 2x UVs without this.
+            if (ucode_handler_index == ucode_f3ddkr && !is_rect &&
+                (mRdp->other_mode_h & G_TP_PERSP) == 0) {
+                u *= 0.5f;
+                v *= 0.5f;
+            }
+
             if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
                 // Linear filter adds 0.5f to the coordinates
                 if (!is_rect) {
@@ -2167,7 +2246,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
-                mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+                // [port] F3DDKR carries a per-vertex fog factor from transformed depth;
+                // the generic ucodes fog through the vertex color alpha.
+                mBufVbo[mBufVboLen++] = (ucode_handler_index == ucode_f3ddkr && !is_rect)
+                                            ? v_arr[i]->fog / 255.0f
+                                            : v_arr[i]->color.a / 255.0f;
             }
         }
 
@@ -2190,6 +2273,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                     case G_CCMUX_SHADE:
                         color = &v_arr[i]->color;
+                        break;
+                    case G_CCMUX_SHADE_ALPHA:
+                        // [port] F3DDKR directional lighting (G_CC_BLEND_SHADEALPHA) scales
+                        // the blend by the shaded vertex's alpha -- shadeStrength from the
+                        // CPU-side lighting. Feed it as the input slot's RGB.
+                        tmp.r = tmp.g = tmp.b = v_arr[i]->color.a;
+                        color = &tmp;
                         break;
                     case G_CCMUX_ENVIRONMENT:
                         color = &mRdp->env_color;
@@ -2553,14 +2643,25 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
 }
 
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
-    SUPPORT_CHECK(uls == 0);
-    SUPPORT_CHECK(ult == 0);
+    // [port] Rare's prebuilt material display lists sometimes carry a nonzero top-left
+    // texel here; upstream aborts on that. The game only loads whole texture blocks,
+    // so log the parameters and treat the origin as zero instead of asserting.
+    static int s_origin_reports = 0;
+    if ((uls != 0 || ult != 0) && s_origin_reports++ < 20) {
+        SPDLOG_WARN("[rdp] LOAD_BLOCK nonzero origin uls={} ult={} lrs={} tmem={:x}", uls, ult, lrs,
+                    mRdp->texture_tile[tile].tmem);
+    }
 
     // The lrs field rather seems to be number of pixels to load
     uint32_t word_size_shift = 0;
     switch (mRdp->texture_to_load.siz) {
         case G_IM_SIZ_4b:
-            word_size_shift = -1;
+            // DKR's DL stream encodes a 4b LOADBLOCK's lrs already byte-scaled, so the
+            // byte count is (lrs+1) — same as 8b (matches GoldenBalloon gfx_pc_dkr.c:3184
+            // `default: shift = 0`). The previous -1 stored into this uint32_t as
+            // 0xFFFFFFFF, which the `(shift > 0)` guard sent into `(lrs+1) << 0xFFFFFFFF`
+            // (UB → 0), zeroing size_bytes for every CI4/IA4/I4 load and skipping upload.
+            word_size_shift = 0;
             break;
         case G_IM_SIZ_8b:
             word_size_shift = 0;
@@ -2621,6 +2722,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_swapped = (dxt == 0);
     // fprintf(stderr, "GfxDpLoadBlock: line_size = 0x%x; orig = 0x%x; bpp=%d; lrs=%d\n", size_bytes,
     // orig_size_bytes,
     //         mRdp->texture_to_load.siz, lrs);
@@ -2694,6 +2796,8 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr + start_offset_bytes;
+    // LoadTile walks the source row by row, so it never carries pre-swapped rows.
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_swapped = false;
 
     const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
@@ -3308,7 +3412,8 @@ bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
 }
 
 bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
-    // TODO:
+    // No-op is safe: without G_CULLDL handling every display list renders in full, so
+    // skipping it only costs fill, never correctness.
     return false;
 }
 
@@ -4776,6 +4881,94 @@ struct DkrVertex {
 };
 #pragma pack(pop)
 
+// [port] Per-vertex fog factor from the transformed depth (z/w * mul + offset),
+// matching what the F3DDKR RSP interpolated per vertex.
+static uint8_t dkr_fog_from_clip(float z, float w, int16_t fog_mul, int16_t fog_offset) {
+    if (!isfinite(z) || !isfinite(w)) {
+        return 0;
+    }
+    if (w == 0.0f) {
+        w = 1.0e-6f;
+    }
+    float fog = (z / w) * (float)fog_mul + (float)fog_offset;
+    if (!isfinite(fog) || fog <= 0.0f) {
+        return 0;
+    }
+    if (fog >= 255.0f) {
+        return 255;
+    }
+    return (uint8_t)fog;
+}
+
+// [port] Sutherland-Hodgman clip against the near plane (z + w >= 0), matching the
+// F3DDKR RSP near clipping. Without it, triangles crossing the eye plane rasterize
+// as giant stretched slivers.
+static float dkr_clip_dist_f3ddkr(const struct LoadedVertex* v) {
+    return v->z + v->w;
+}
+
+static uint8_t dkr_lerp_u8_f3ddkr(uint8_t a, uint8_t b, float t) {
+    return (uint8_t) (a + (b - a) * t + 0.5f);
+}
+
+static void dkr_lerp_vertex_f3ddkr(struct LoadedVertex* out, const struct LoadedVertex* a,
+                                   const struct LoadedVertex* b, float t, uint32_t geometry_mode,
+                                   int16_t fog_mul, int16_t fog_offset) {
+    out->x = a->x + (b->x - a->x) * t;
+    out->y = a->y + (b->y - a->y) * t;
+    out->z = a->z + (b->z - a->z) * t;
+    out->w = a->w + (b->w - a->w) * t;
+    out->u = a->u + (b->u - a->u) * t;
+    out->v = a->v + (b->v - a->v) * t;
+    out->color.r = dkr_lerp_u8_f3ddkr(a->color.r, b->color.r, t);
+    out->color.g = dkr_lerp_u8_f3ddkr(a->color.g, b->color.g, t);
+    out->color.b = dkr_lerp_u8_f3ddkr(a->color.b, b->color.b, t);
+    out->color.a = dkr_lerp_u8_f3ddkr(a->color.a, b->color.a, t);
+    if (geometry_mode & G_FOG) {
+        out->fog = dkr_fog_from_clip(out->z, out->w, fog_mul, fog_offset);
+    } else {
+        out->fog = dkr_lerp_u8_f3ddkr(a->fog, b->fog, t);
+    }
+}
+
+static int dkr_clip_near_f3ddkr(const struct LoadedVertex* in, int n, struct LoadedVertex* out,
+                                uint32_t geometry_mode, int16_t fog_mul, int16_t fog_offset) {
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        const struct LoadedVertex* cur = &in[i];
+        const struct LoadedVertex* nxt = &in[(i + 1) % n];
+        float dc = dkr_clip_dist_f3ddkr(cur);
+        float dn = dkr_clip_dist_f3ddkr(nxt);
+        bool cur_in = dc >= 0.0f;
+        bool nxt_in = dn >= 0.0f;
+        if (cur_in && count < 4) {
+            out[count++] = *cur;
+        }
+        if (cur_in != nxt_in && count < 4) {
+            float denom = dc - dn;
+            if (denom != 0.0f) {
+                float t = dc / denom;
+                if (t < 0.0f) t = 0.0f;
+                else if (t > 1.0f) t = 1.0f;
+                dkr_lerp_vertex_f3ddkr(&out[count++], cur, nxt, t, geometry_mode, fog_mul, fog_offset);
+            }
+        }
+    }
+    return count;
+}
+
+// Screen-space signed area in NDC (>0 CCW), used for the per-triangle backface test.
+static float dkr_ndc_cross_f3ddkr(const struct LoadedVertex* a, const struct LoadedVertex* b,
+                                  const struct LoadedVertex* c) {
+    float aw = a->w != 0 ? a->w : 1e-6f;
+    float bw = b->w != 0 ? b->w : 1e-6f;
+    float cw = c->w != 0 ? c->w : 1e-6f;
+    float ax = a->x / aw, ay = a->y / aw;
+    float bx = b->x / bw, by = b->y / bw;
+    float cx = c->x / cw, cy = c->y / cw;
+    return (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+}
+
 bool gfx_vtx_handler_f3ddkr(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4788,47 +4981,48 @@ bool gfx_vtx_handler_f3ddkr(F3DGfx** cmd0) {
     const DkrVertex* src = (const DkrVertex*)gfx->SegAddr(cmd->words.w1);
     if (src == nullptr) return false;
 
-    for (int i = 0; i < n && dest < MAX_VERTICES; i++, dest++) {
+    int i = 0;
+    for (; i < n && dest < MAX_VERTICES; i++, dest++) {
         struct LoadedVertex* d = &gfx->mRsp->loaded_vertices[dest];
 
         float x = src[i].x;
         float y = src[i].y;
         float z = src[i].z;
 
-        // Billboard: add anchor clip coords after MVP transform
-        if (gfx->mRsp->dkr_billboard_enabled && dest > 0 &&
-            append) {
-            // Billboard vertices: transform by billboard matrix (slot 2), then add anchor
-            float (*m)[4] = gfx->mRsp->dkr_matrix_slots[2];
-            x = src[i].x * m[0][0] + src[i].y * m[1][0] + src[i].z * m[2][0] + m[3][0];
-            y = src[i].x * m[0][1] + src[i].y * m[1][1] + src[i].z * m[2][1] + m[3][1];
-            z = src[i].x * m[0][2] + src[i].y * m[1][2] + src[i].z * m[2][2] + m[3][2];
-            float w = src[i].x * m[0][3] + src[i].y * m[1][3] + src[i].z * m[2][3] + m[3][3];
+        // [port] Row-vector transform through the selected MVP matrix. While
+        // billboarding is enabled, EVERY vertex adds the transformed clip position
+        // of vertex 0 and INHERITS its w (after the MVP, before the divide). The
+        // game loads the billboard matrix into slot 2 and selects it before
+        // enabling billboarding, so MP_matrix already holds it here.
+        float (*m)[4] = gfx->mRsp->MP_matrix;
+        float cx = x * m[0][0] + y * m[1][0] + z * m[2][0] + m[3][0];
+        float cy = x * m[0][1] + y * m[1][1] + z * m[2][1] + m[3][1];
+        float cz = x * m[0][2] + y * m[1][2] + z * m[2][2] + m[3][2];
+        float cw = x * m[0][3] + y * m[1][3] + z * m[2][3] + m[3][3];
 
-            // Add anchor vertex's clip coords
+        if (gfx->mRsp->dkr_billboard_enabled) {
             struct LoadedVertex* anchor = &gfx->mRsp->loaded_vertices[0];
-            x += anchor->x;
-            y += anchor->y;
-            z += anchor->z;
-            w += anchor->w;
-
-            d->x = x;
-            d->y = y;
-            d->z = z;
-            d->w = w;
+            d->x = anchor->x + cx;
+            d->y = anchor->y + cy;
+            d->z = anchor->z + cz;
+            d->w = anchor->w;
         } else {
-            // Standard MVP transform
-            float (*m)[4] = gfx->mRsp->MP_matrix;
-            d->x = x * m[0][0] + y * m[1][0] + z * m[2][0] + m[3][0];
-            d->y = x * m[0][1] + y * m[1][1] + z * m[2][1] + m[3][1];
-            d->z = x * m[0][2] + y * m[1][2] + z * m[2][2] + m[3][2];
-            d->w = x * m[0][3] + y * m[1][3] + z * m[2][3] + m[3][3];
+            d->x = cx;
+            d->y = cy;
+            d->z = cz;
+            d->w = cw;
         }
 
         d->color.r = src[i].r;
         d->color.g = src[i].g;
         d->color.b = src[i].b;
         d->color.a = src[i].a;
+
+        if (gfx->mRsp->geometry_mode & G_FOG) {
+            d->fog = dkr_fog_from_clip(d->z, d->w, gfx->mRsp->fog_mul, gfx->mRsp->fog_offset);
+        } else {
+            d->fog = 0;
+        }
 
         d->clip_rej = 0;
         if (d->x < -d->w) d->clip_rej |= 1;
@@ -4841,7 +5035,21 @@ bool gfx_vtx_handler_f3ddkr(F3DGfx** cmd0) {
         d->v = 0;
     }
 
-    gfx->mRsp->dkr_vertex_count = append ? dest : n;
+    // [port] The loop above silently stops at MAX_VERTICES; flag loads that didn't fit,
+    // since every triangle referencing a dropped vertex gets dropped in turn.
+    if (i < n) {
+        static int s_trunc_reports = 0;
+        if (s_trunc_reports++ < 20) {
+            SPDLOG_WARN("[f3ddkr] {}-vertex {} load truncated at {} loaded, {} dropped", n, append ? "append" : "fresh",
+                        (int) dest, n - i);
+        }
+    }
+    // [port] G_VTX_APPEND is not a running cursor: the RSP keeps ONE count -- the
+    // length of the last flag-0 load -- and every flag-1 load writes right after
+    // THAT, so consecutive appends land on the same base and overwrite each other
+    // (sprite frames wider than one batch restart their triangle indices at 1 per
+    // run and depend on this).
+    if (!append) gfx->mRsp->dkr_vertex_count = (uint8_t) n;
     return false;
 }
 
@@ -4872,13 +5080,70 @@ bool gfx_trin_handler_f3ddkr(F3DGfx** cmd0) {
     // UV (0,0) and renders solid black.
     struct LoadedVertex* lv = gfx->mRsp->loaded_vertices;
     for (int i = 0; i < numTris; i++) {
+        // [port] A triangle may only reference vertices that are actually loaded. Game
+        // data can exceed the vertex window (append runs past MAX_VERTICES, or a stale
+        // display list); drawing those triangles would write past loaded_vertices, so
+        // drop them loudly instead.
+        if (tris[i].vi0 >= MAX_VERTICES || tris[i].vi1 >= MAX_VERTICES || tris[i].vi2 >= MAX_VERTICES) {
+            static int s_reports = 0;
+            if (s_reports++ < 20) {
+                const uint8_t* raw = (const uint8_t*) &tris[i];
+                SPDLOG_WARN("[f3ddkr] dropping {} tris in a {} tri run: vertex indices {}/{}/{} beyond the {} "
+                            "loaded (vertex count {}) list @{:x} bytes {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
+                            numTris - i, numTris, tris[i].vi0, tris[i].vi1, tris[i].vi2, MAX_VERTICES,
+                            gfx->mRsp->dkr_vertex_count, (uintptr_t) &tris[i], raw[0], raw[1], raw[2], raw[3], raw[4],
+                            raw[5], raw[6], raw[7]);
+            }
+            continue;
+        }
         lv[tris[i].vi0].u = (float) tris[i].uv0u;
         lv[tris[i].vi0].v = (float) tris[i].uv0v;
         lv[tris[i].vi1].u = (float) tris[i].uv1u;
         lv[tris[i].vi1].v = (float) tris[i].uv1v;
         lv[tris[i].vi2].u = (float) tris[i].uv2u;
         lv[tris[i].vi2].v = (float) tris[i].uv2v;
-        gfx->GfxSpTri1(tris[i].vi0, tris[i].vi1, tris[i].vi2, false);
+
+        // [port] Near-plane clip FIRST so everything downstream has a positive w:
+        // a triangle straddling the eye plane becomes a quad, and one entirely
+        // behind it disappears here (that is the plane doing its job, not a cull).
+        struct LoadedVertex tri[3] = { lv[tris[i].vi0], lv[tris[i].vi1], lv[tris[i].vi2] };
+        struct LoadedVertex poly[4];
+        int pn = dkr_clip_near_f3ddkr(tri, 3, poly, gfx->mRsp->geometry_mode, gfx->mRsp->fog_mul,
+                                      gfx->mRsp->fog_offset);
+        if (pn < 3) continue;
+        bool degenerate = false;
+        for (int k = 0; k < pn; k++) {
+            if (!(poly[k].w > 0.0f)) {
+                degenerate = true;
+                break;
+            }
+        }
+        if (degenerate) continue;
+
+        // [port] Backface cull by the clipped polygon signed area in NDC, unless the
+        // triangle opts out with BACKFACE_DRAW (0x40). dRspInit leaves the geometry
+        // cull bits cleared, so this per-triangle flag is the whole story.
+        if (!(tris[i].flags & 0x40)) {
+            float area = 0.0f;
+            for (int k = 1; k + 1 < pn; k++) {
+                area += dkr_ndc_cross_f3ddkr(&poly[0], &poly[k], &poly[k + 1]);
+            }
+            if (area < 0.0f) continue;
+        }
+
+        if (pn == 3) {
+            gfx->GfxSpTri1(tris[i].vi0, tris[i].vi1, tris[i].vi2, false);
+        } else {
+            // Emit the clipped quad from the scratch slots past the vertex window
+            // (only the rectangle path uses those, within a single call).
+            for (int k = 0; k < pn; k++) {
+                gfx->mRsp->loaded_vertices[MAX_VERTICES + k] = poly[k];
+                gfx->mRsp->loaded_vertices[MAX_VERTICES + k].clip_rej = 0;
+            }
+            for (int k = 1; k + 1 < pn; k++) {
+                gfx->GfxSpTri1(MAX_VERTICES, MAX_VERTICES + k, MAX_VERTICES + k + 1, false);
+            }
+        }
     }
 
     return false;
@@ -4893,16 +5158,27 @@ bool gfx_dmadl_handler_f3ddkr(F3DGfx** cmd0) {
 
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
     if (subGFX != nullptr) {
-        // DKR's G_DMADL has no ENDDL terminator. Copy nCmds commands to a static
-        // buffer, append an ENDDL command, then push the buffer so the Run loop
-        // processes exactly the right number of commands and returns cleanly.
+        // [port] DKR's G_DMADL has no ENDDL terminator. Copy nCmds commands into the
+        // per-frame arena, append an ENDDL, and push the copy so the Run loop executes
+        // exactly the right number of commands and returns cleanly. The arena (not a
+        // fixed buffer) matters for two reasons: nCmds reaches 255, and G_DMADL nests --
+        // a shared static buffer gets overwritten while the outer sub-DL is still on
+        // the executor stack. The capacity guard keeps the arena from ever reallocating,
+        // which would invalidate the outer sub-DL's live cursor.
         uint32_t nCmds = (cmd->words.w0 >> 16) & 0xFF;
-        if (nCmds > 0 && nCmds < 64) {
-            static F3DGfx tempDL[65];
-            memcpy(tempDL, subGFX, nCmds * sizeof(F3DGfx));
-            tempDL[nCmds].words.w0 = (uintptr_t)(F3DEX_G_ENDDL << 24);
-            tempDL[nCmds].words.w1 = 0;
-            g_exec_stack.call(*cmd0, tempDL);
+        if (nCmds > 0) {
+            if (gfx->mDmadlExecArena.size() + nCmds + 1 > gfx->mDmadlExecArena.capacity()) {
+                SPDLOG_WARN("[f3ddkr] G_DMADL arena exhausted, skipping a {} command sub-DL", nCmds);
+                return false;
+            }
+            size_t base = gfx->mDmadlExecArena.size();
+            for (uint32_t i = 0; i < nCmds; i++) {
+                gfx->mDmadlExecArena.push_back(subGFX[i]);
+            }
+            F3DGfx end{};
+            end.words.w0 = (uintptr_t)(F3DEX_G_ENDDL << 24);
+            gfx->mDmadlExecArena.push_back(end);
+            g_exec_stack.call(*cmd0, &gfx->mDmadlExecArena[base]);
         }
     }
 
@@ -4922,12 +5198,12 @@ bool gfx_moveword_handler_f3ddkr(F3DGfx** cmd0) {
             gfx->mRsp->dkr_billboard_enabled = (data != 0);
             break;
         case 0x0A: // G_MW_MVPMATRIX — select which matrix slot to use as MVP
-            gfx->mRsp->dkr_mvp_slot = (data >> 6) & 3;
             {
-                uint8_t slot = gfx->mRsp->dkr_mvp_slot;
-                if (slot < 3) {
-                    memcpy(gfx->mRsp->MP_matrix, gfx->mRsp->dkr_matrix_slots[slot], sizeof(float) * 16);
-                }
+                // F3DDKR has three slots; fold the fourth encoding onto slot 0.
+                uint8_t slot = (data >> 6) & 3;
+                if (slot > 2) slot = 0;
+                gfx->mRsp->dkr_mvp_slot = slot;
+                memcpy(gfx->mRsp->MP_matrix, gfx->mRsp->dkr_matrix_slots[slot], sizeof(float) * 16);
             }
             break;
         case 0x06: // G_MW_SEGMENT — standard
@@ -4941,10 +5217,21 @@ bool gfx_moveword_handler_f3ddkr(F3DGfx** cmd0) {
             gfx->mRsp->fog_offset = (int16_t)data;
             break;
         default:
+            // 0x04 (G_MW_CLIP / gsSPClipRatio) and G_MW_PERSPNORM are emitted by the game
+            // but have no effect here: the vertex handler does its own frustum rejection
+            // and this renderer applies no perspective correction scalar.
             break;
     }
 
     return false;
+}
+
+// [port] An all-zero matrix is not a real transform: it collapses every vertex to
+// (0,0,0,0), and DKR's matrix pool has unfilled slots on some frames. Treat it as
+// identity so geometry that carries its own coordinates still renders.
+static void dkr_fill_identity_matrix(float (*m)[4]) {
+    memset(m, 0, sizeof(float) * 16);
+    m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.0f;
 }
 
 bool gfx_mtx_handler_f3ddkr(F3DGfx** cmd0) {
@@ -4952,34 +5239,63 @@ bool gfx_mtx_handler_f3ddkr(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     uint8_t param = C0(16, 8);
+    // F3DDKR has three matrix slots; the two-bit encoded index can name a fourth.
+    // Fold it onto slot 0, as the MVP-select moveword does.
     uint8_t slot = (param >> 6) & 3;
+    if (slot > 2) slot = 0;
 
+    // [port] Loading a slot also SELECTS it: the game loads the billboard matrix
+    // into slot 2 and immediately draws without an explicit gSPSelectMatrixDKR in
+    // between (camera.c billboard setup), and objects.c pairs its slot-2 detour
+    // with an explicit select back to slot 1.
+    gfx->mRsp->dkr_mvp_slot = slot;
+
+    float (*target)[4] = gfx->mRsp->dkr_matrix_slots[slot];
     const int32_t* addr = (const int32_t*)gfx->SegAddr(cmd->words.w1);
-    if (addr == nullptr) return false;
 
-    float (*target)[4];
-    if (slot < 3) {
-        target = gfx->mRsp->dkr_matrix_slots[slot];
-    } else {
-        target = gfx->mRsp->MP_matrix;
+    // Frame interpolation hands in blended matrices keyed by the Mtx the game wrote.
+    if (auto it = gfx->mCurMtxReplacements->find((Mtx*)addr); it != gfx->mCurMtxReplacements->end()) {
+        memcpy(target, it->second.mf, sizeof(float) * 16);
+        memcpy(gfx->mRsp->MP_matrix, target, sizeof(float) * 16);
+        return false;
     }
 
 #ifdef GBI_FLOATS
-    memcpy(target, addr, sizeof(float) * 16);
+    if (addr == nullptr) {
+        dkr_fill_identity_matrix(target);
+    } else {
+        const float* f = (const float*)addr;
+        bool all_zero = true;
+        for (int k = 0; k < 16; k++) {
+            if (f[k] != 0.0f) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            dkr_fill_identity_matrix(target);
+        } else {
+            memcpy(target, addr, sizeof(float) * 16);
+        }
+    }
 #else
     // Convert s16.16 fixed-point to float
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            int32_t q = addr[i * 4 + j];
-            target[i][j] = q / 65536.0f;
+    if (addr == nullptr) {
+        dkr_fill_identity_matrix(target);
+    } else {
+        uint32_t orbits = 0;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                int32_t q = addr[i * 4 + j];
+                orbits |= (uint32_t)q;
+                target[i][j] = q / 65536.0f;
+            }
         }
+        if (orbits == 0) dkr_fill_identity_matrix(target);
     }
 #endif
 
-    // If this is the active MVP slot, also update MP_matrix
-    if (slot < 3 && slot == gfx->mRsp->dkr_mvp_slot) {
-        memcpy(gfx->mRsp->MP_matrix, target, sizeof(float) * 16);
-    }
+    memcpy(gfx->mRsp->MP_matrix, target, sizeof(float) * 16);
 
     return false;
 }
@@ -5002,7 +5318,6 @@ static constexpr UcodeHandler f3ddkrHandlers = {
     { F3DEX_G_CLEARGEOMETRYMODE, { "G_CLEARGEOMETRYMODE", gfx_clear_geometry_mode_handler_f3dex } },
     { F3DEX_G_TRI1, { "G_TRI1", gfx_tri1_handler_f3d } },
     { F3DEX_G_MODIFYVTX, { "G_MODIFYVTX", gfx_modify_vtx_handler_f3dex2 } },
-    { F3DEX_G_DL, { "G_DL", gfx_dl_handler_common } },
     { F3DEX_G_ENDDL, { "G_ENDDL", gfx_end_dl_handler_common } },
     { F3DEX_G_SPNOOP, { "G_SPNOOP", gfx_spnoop_command_handler_f3dex2 } },
     { F3DEX_G_RDPHALF_1, { "mRdpHALF_1", gfx_stubbed_command_handler } },
@@ -5098,10 +5413,19 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
     }
 }
 
+// [port] Per-frame count of executed F3DDKR display list commands, shown by the port's
+// debug suite. Defined in the port layer (Engine.cpp).
+extern "C" int gDkrDlCmdCount;
+
 static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+
+    if (ucode_handler_index == ucode_f3ddkr) {
+        gDkrDlCmdCount++;
+    }
+
 
 #ifdef USE_GBI_TRACE
     if (cmd->words.trace.valid &&
@@ -5178,6 +5502,19 @@ void Interpreter::SpReset() {
     mRsp->lookat[1].dir[2] = 0;
     CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
     CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+
+    // [port] F3DDKR state: a display list that stops mid-billboard (or mid vertex-append
+    // run) must not leak its state into the next frame's G_VTX batches.
+    mRsp->dkr_billboard_enabled = false;
+    mRsp->dkr_mvp_slot = 0;
+    mRsp->dkr_vertex_count = 0;
+    mRsp->MP_matrix[0][0] = mRsp->MP_matrix[1][1] = mRsp->MP_matrix[2][2] = mRsp->MP_matrix[3][3] = 1.0f;
+    // [port] Seed the three F3DDKR matrix slots with identity so a draw issued before
+    // the first G_MTX still transforms sanely (DKR's matrix pool has unfilled slots
+    // on some frames; a zero matrix would collapse every vertex to the origin).
+    for (int slot = 0; slot < 3; slot++) {
+        dkr_fill_identity_matrix(mRsp->dkr_matrix_slots[slot]);
+    }
 }
 
 void Interpreter::RegisterFbTexture(const void* cpuAddr, int fbId) {
@@ -5368,6 +5705,12 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+
+    // [port] G_DMADL copies live here; they never outlive the frame that queued them.
+    // The reserve happens once: after the first frame the vector keeps its capacity and
+    // never reallocates, keeping every queued sub-DL's address stable for the executor.
+    mDmadlExecArena.clear();
+    mDmadlExecArena.reserve(1 << 16);
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -5721,6 +6064,13 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
+}
+
+extern "C" void gfx_texture_cache_delete_range(const void* start, size_t size) {
+    auto instance = Fast::mInstance.lock();
+    if (instance != nullptr) {
+        instance->TextureCacheDeleteRange((const uint8_t*) start, size);
+    }
 }
 
 extern "C" void gfx_shader_cache_clear() {
